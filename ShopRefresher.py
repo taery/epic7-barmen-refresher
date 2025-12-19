@@ -1,19 +1,22 @@
+import os
 import csv
 import random
 import threading
 import time
 from datetime import datetime
-import os
+from typing import Callable
 # For GUI
 import tkinter as tk
 from tkinter import ttk
 
+
+import cv2
+import mss
 import numpy as np
 import pyautogui
 
 # WORK with images
-import cv2
-from PIL import ImageTk, Image, ImageDraw
+from PIL import ImageTk, Image, ImageGrab
 
 # Work with macOS app windows
 from atomacos import NativeUIElement, getAppRefByBundleId
@@ -21,14 +24,15 @@ from atomacos import NativeUIElement, getAppRefByBundleId
 
 class AppConfig:
     def __init__(self):
-        self.DEBUG = True
+        self.DEBUG = False
 
         # general setting
         self.app_title = 'Epic Seven'
         # list of all the purchasable item
-        self.ALL_ITEMS = [['cov2.png', 'Covenant bookmark', 184000, 'cov_buy.png'],
-                          ['mys.png', 'Mystic medal', 280000, 'mys_buy.png']]
-        # self.MANDATORY_PATH = {'cov.png', 'mys.png'}  # make item unable to be unselected
+        self.ALL_ITEMS = [
+            ['mys.png', 'Mystic medal', 280000],
+            ['cov.png', 'Covenant bookmark', 184000],
+                          ]
 
         # gui
         # color
@@ -42,6 +46,35 @@ class AppConfig:
         self.skip_items = set()
 
 
+def activate_game():
+    """
+    Activate application using PyObjC (most reliable method).
+    """
+    try:
+        from Cocoa import NSWorkspace, NSApplicationActivateIgnoringOtherApps
+
+        workspace = NSWorkspace.sharedWorkspace()
+        apps = workspace.runningApplications()
+        bundle_id = 'com.stove.epic7.ios'
+
+        target_app = next(
+            (app for app in apps if app.bundleIdentifier() == ('%s' % bundle_id)),
+            None
+        )
+        if target_app is None:
+            print(f"❌ Application {bundle_id} is not running")
+            return False
+
+        # Activate with option to ignore other apps (force to front)
+        success = target_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+        return success
+    except ImportError:
+        print("⚠️  PyObjC not installed, falling back to AppleScript")
+        return False
+    except Exception as e:
+        print(f"⚠️  PyObjC activation failed: {e}")
+        return False
+
 def find_window(title) -> NativeUIElement | None:
     system = getAppRefByBundleId("com.stove.epic7.ios")
     return next(iter(system.windows(match=title)), None)
@@ -54,16 +87,17 @@ def safe_get_window_param(window) -> tuple[int, int, int, int]:
 
 
 def get_relative_path(file_name):
+    if not file_name:
+        raise Exception("No file name provided")
     return os.path.join('assets', file_name)
 
 
 def validate_float(value, action):
     if action != '1':
         return True
-
     try:
         return 0 <= float(value) <= 10
-    except:
+    except ValueError:
         return False
 
 
@@ -73,32 +107,53 @@ def validate_int(value):
 
     try:
         int_value = int(value)
-    except:
+    except ValueError:
         return False
 
     return 0 <= int_value < 100000000
 
 
-def safe_locate_center_button_on_screen(image_path, confidence=0.8) -> pyautogui.Point | None:
-    try:
-        return pyautogui.locateCenterOnScreen(image_path, confidence=confidence)
-    except Exception as e:
-        print('No button found on screen:', image_path)
-        print(e)
-        return None
+def save_debug_screenshot(image_path: str, box=None, center=None, debug_dir: str = 'debug_screens'):
+    """Save a screenshot with a red rectangle around `box` and a marker at `center`."""
+    from PIL import ImageDraw, ImageFont
+
+    os.makedirs(debug_dir, exist_ok=True)
+    shot = pyautogui.screenshot()
+    draw = ImageDraw.Draw(shot)
+
+    if not box or not center:
+        fname = os.path.join(debug_dir, f'annot_{os.path.basename(image_path)}_{int(time.time())}.png')
+        shot.save(fname)
+        return fname
+
+    # box has attributes left, top, width, height
+    x1, y1 = box.left, box.top
+    x2, y2 = box.left + box.width, box.top + box.height
+    print(x1, y1, x2, y2)
+
+    # rectangle + center marker
+    outline = (255, 0, 0)
+    draw.rectangle([x1, y1, x2, y2], outline=outline, width=3)
+    print('drow center at:', center)
+    r = 6
+    draw.ellipse([(center.x - r, center.y - r), (center.x + r, center.y + r)], fill=outline)
+
+    fname = os.path.join(debug_dir, f'annot_{os.path.basename(image_path)}_{int(time.time())}.png')
+    shot.save(fname)
+    return fname
 
 
 class ShopItem:
-    def __init__(self, path='', image=None, price=0, count=0, buy_button=''):
+    def __init__(self, path='', show_image=None, search_image=None, price=0, count=0):
         self.path = path
-        self.image = image
+        self.show_image = show_image
+        self.search_image = search_image
         self.price = price
         self.count = count
-        self.buy_button = buy_button
 
     def __repr__(self):
-        return (f'ShopItem(path={self.path}, image={self.image}, price={self.price}, count={self.count}, '
-                f'buy_button={self.buy_button})')
+        return (f'ShopItem(path={self.path}, show_image={self.show_image}, search_image={self.search_image},'
+                f' price={self.price}, count={self.count}')
 
 
 class RefreshStatistic:
@@ -111,10 +166,15 @@ class RefreshStatistic:
         self.start_time = datetime.now()
 
     def add_shop_item(self, path: str, name='', price=0, count=0):
-        image = Image.open(get_relative_path(path))
-        image = image.resize((45, 45))
+        relative_path = get_relative_path(path)
+        image = Image.open(relative_path).resize((45, 45))
         image = ImageTk.PhotoImage(image)
-        self.items[name] = ShopItem(path, image, price, count)
+
+        image2 = cv2.imread(relative_path)
+        image2 = cv2.cvtColor(image2, cv2.COLOR_BGR2GRAY)
+        if path == 'mys.png':
+            image2 = cv2.resize(image2, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_LINEAR)
+        self.items[name] = ShopItem(path, show_image=image, search_image=image2, price=price, count=count)
 
     def get_inventory(self):
         return self.items
@@ -122,20 +182,17 @@ class RefreshStatistic:
     def get_names(self):
         return list(self.items.keys())
 
-    def get_images(self):
-        return [shop_item.image for shop_item in self.items.values()]
+    def get_show_images(self):
+        return [_.show_image for _ in self.items.values()]
 
     def get_paths(self):
-        return [shop_item.path for shop_item in self.items.values()]
+        return [_.path for _ in self.items.values()]
 
     def get_item_counts(self):
-        return [shop_item.count for shop_item in self.items.values()]
+        return [_.count for _ in self.items.values()]
 
     def get_total_cost(self):
-        total = 0
-        for shop_item in self.items.values():
-            total += shop_item.price * shop_item.count
-        return total
+        return sum(_.price * _.count for _ in self.items.values())
 
     def increment_refresh_count(self):
         self.refresh_count += 1
@@ -155,9 +212,9 @@ class RefreshStatistic:
         if not os.path.isfile(path):
             with open(path, 'w', newline='') as file:
                 writer = csv.writer(file)
-                column_name = ['Time', 'Duration', 'Refresh count', 'Skystone spent', 'Gold spent']
-                column_name.extend(self.get_names())
-                writer.writerow(column_name)
+                column_names = ['Time', 'Duration', 'Refresh count', 'Skystone spent', 'Gold spent']
+                column_names.extend(self.get_names())
+                writer.writerow(column_names)
 
         with open(path, 'a', newline='') as file:
             writer = csv.writer(file)
@@ -168,159 +225,237 @@ class RefreshStatistic:
 
 
 class SecretShopRefresh:
-    def __init__(self, title_name: str, callback=None, root_window: tk = None, budget: int = None,
+    def __init__(self, title_name: str, terminate_callback: Callable[[], None], settings_window: tk = None,
+                 budget: int = None,
                  debug: bool = False):
         # init state
         self.debug = debug
         self.mouse_sleep = 0.3
         self.screenshot_sleep = 0.3
-        self.callback = callback if callback else self.refresh_finish_callback
+        self.terminate_callback = terminate_callback
         self.budget = budget
 
         # find window
-        self.window: NativeUIElement = find_window(title_name)
-        self.root_window = root_window
+        self.game_window: NativeUIElement = find_window(title_name)
+        self.settings_window = settings_window
         self.statistic_calculator = RefreshStatistic()
 
         # stop control and worker thread
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
-    # Start shop refresh macro
+        # Global keyboard listener for ESC key
+        self._event_monitor = None
+        self._esc_check_thread = None
+
+    def _check_esc_key_macos(self):
+        """
+        macOS-native ESC key monitoring using Cocoa events.
+        Runs in a separate thread.
+        """
+        from Cocoa import NSEvent, NSEventMaskKeyDown
+        import Quartz
+
+        def callback(proxy, event_type, event, refcon):
+            """Callback for global event monitor."""
+            try:
+                # Check if ESC key (keycode 53)
+                keycode = Quartz.CGEventGetIntegerValueField(
+                    event,
+                    Quartz.kCGKeyboardEventKeycode
+                )
+
+                if keycode == 53:  # ESC key
+                    print("🛑 ESC pressed - stopping refresh...")
+                    self._stop_event.set()
+
+            except Exception as e:
+                if self.debug:
+                    print(f"Event monitor error: {e}")
+
+            # Return event to allow normal processing
+            return event
+
+        # Create event tap
+        try:
+            tap = Quartz.CGEventTapCreate(
+                Quartz.kCGSessionEventTap,
+                Quartz.kCGHeadInsertEventTap,
+                Quartz.kCGEventTapOptionDefault,
+                Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown),
+                callback,
+                None
+            )
+
+            if tap is None:
+                print("⚠️ Failed to create event tap - accessibility permissions may be needed")
+                return
+
+            # Create run loop source
+            run_loop_source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+            Quartz.CFRunLoopAddSource(
+                Quartz.CFRunLoopGetCurrent(),
+                run_loop_source,
+                Quartz.kCFRunLoopCommonModes
+            )
+
+            # Enable the tap
+            Quartz.CGEventTapEnable(tap, True)
+
+            # Run the loop
+            Quartz.CFRunLoopRun()
+
+        except Exception as e:
+            print(f"Event tap error: {e}")
+
+
     def start(self):
-        print('Starting refreshing ...')
+        if self.debug: print('Starting refreshing ...')
 
-        refresh_thread = threading.Thread(target=self.shop_refresh_loop)
-        refresh_thread.daemon = True
-        refresh_thread.start()
+        # Start macOS event monitor in separate thread
+        self._esc_check_thread = threading.Thread(
+            target=self._check_esc_key_macos,
+            daemon=True
+        )
+        self._esc_check_thread.start()
 
-        self._thread = refresh_thread
+        self._thread = threading.Thread(target=self.shop_refresh_loop, daemon=True)
+        self._thread.start()
 
     def stop(self):
         self._stop_event.set()
 
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
+
         print('Terminating shop refresh ...')
 
-    def _run_loop(self):
-        try:
-            if hasattr(self, 'shop_refresh_loop') and callable(getattr(self, 'shop_refresh_loop')):
-                try:
-                    self.shop_refresh_loop()
-                except Exception as e:
-                    print('shop_refresh_loop error:', e)
-            else:
-                print('shop_refresh_loop not implemented.')
-        finally:
-            # Ensure callback runs on Tk main thread if root_window provided
-            try:
-                if self.root_window:
-                    self.root_window.after(0, self.callback)
-                else:
-                    self.callback()
-            except Exception:
-                self.callback()
+    def take_screenshot(self) -> np.ndarray:
+        left, top, width, height = safe_get_window_param(self.game_window)
+        region = [left, top, width, height]
+        print('Taking screenshot at region:', region)
+        screenshot = ImageGrab.grab(bbox=(left, top, left + width, top + height),
+                                    all_screens=True)
+        screenshot.save('debug_screenshot.png')
+        screenshot = np.array(screenshot)
+        screenshot = cv2.cvtColor(screenshot, cv2.COLOR_BGR2GRAY)
+        return screenshot
 
-    def refresh_finish_callback(self):
-        print('Refresher Terminated!')
+    def take_screenshot_mss(self) -> np.ndarray:
+        """Capture the game window using mss for native-quality (Retina-safe) pixels."""
+        left, top, width, height = safe_get_window_param(self.game_window)
+        monitor = {"left": int(left), "top": int(top), "width": int(width), "height": int(height)}
+        with mss.mss() as sct:
+            sct_img = sct.grab(monitor)  # raw BGRA
+            arr = np.array(sct_img)  # shape (h, w, 4)
+            if arr.ndim == 3 and arr.shape[2] == 4:
+                bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+            else:
+                bgr = arr[..., :3]
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            return gray
 
     def shop_refresh_loop(self):
         print('Start shop refreshing loop ...')
-        self.window.AXRaise()
+        activate_game()
+        # Show statistics widget
+        hint, mini_labels = self.show_statistics_widget()
 
-        # TODO close on esc?
-        # show mini display
-        # generating mini image
-        hint, mini_labels = self.show_mini_display()
-
-        # update state on minidisplay
-        def update_mini_display():
+        def update_statistics_widget():
             for label, count in zip(mini_labels, self.statistic_calculator.get_item_counts()):
                 label.config(text=count)
 
         def search_and_buy():
+            if self._stop_event.is_set():  # Check for stop at start
+                return
+
             if self.debug: print('Searching for items to buy ...')
+
+            screenshot = self.take_screenshot_mss()
+
             for key, shop_item in self.statistic_calculator.get_inventory().items():
-                if key in bought:
-                    continue
+                if self._stop_event.is_set():  # Check during iteration
+                    return
+
+                if key in bought: continue
                 if self.debug: print('Searching for item:', key)
-                item_pos = safe_locate_center_button_on_screen(get_relative_path(shop_item.path))
+
+                item_pos = self.search_item(screenshot, shop_item)
+
                 if item_pos is not None:
                     if self.debug: print(f'Found item {key} at:', item_pos)
-                    self.click_button(shop_item.buy_button)
-                    # Confirm buy
-                    self.click_button(shop_item.buy_button)
-                    shop_item.count += 1
-                    bought.add(key)
-                    if hint: update_mini_display()
+
+                    if self._stop_event.is_set():  # Check before clicking
+                        return
+
+                    if self.click_buy(item_pos):
+                        shop_item.count += 1
+                        bought.add(key)
+                    if hint: update_statistics_widget()
 
         time.sleep(self.mouse_sleep)
 
         try:
             self.statistic_calculator.update_time()
-            # item sliding const
             sliding_time = max(0.7 + self.screenshot_sleep, 1)
 
             # Loop through shop
             while not self._stop_event.is_set():
-                # array for determining if an item has been purchased in this loop
                 bought = set()
 
-                # take screenshot, check for items, buy all items that appear
-                time.sleep(sliding_time)  # This is a constant sleep to account for the item sliding in frame
+                time.sleep(sliding_time)
 
-                ###start of bundle refresh
                 if self.debug: print('start of bundle refresh')
-                # Search for items to buy
+
+                # Check for stop before each major operation
+                if self._stop_event.is_set():
+                    break
+
                 search_and_buy()
-                self.scroll_up()
-                # Search for items to buy after scrolling up
-                search_and_buy()
+
+                if self._stop_event.is_set():
+                    break
+
                 self.scroll_down()
-                # Search for items to buy after scrolling up
+
+                if self._stop_event.is_set():
+                    break
+
                 search_and_buy()
 
-                if self.debug: print('Finished searching for items to buy, refresh shop now.')
-
+                if self.debug: print(f'Finished searching for items to buy, bought {bought} items, refresh shop now.')
                 if self.debug: time.sleep(5)
-                if self._stop_event.is_set() or self.budget and self.statistic_calculator.refresh_count >= self.budget:
+
+                if self._stop_event.is_set() or (self.budget and
+                                                 self.statistic_calculator.refresh_count >= self.budget):
                     break
 
                 self.click_refresh()
                 self.statistic_calculator.increment_refresh_count()
                 time.sleep(self.mouse_sleep)
+
         except Exception as e:
-            print(e)
+            print(f"Error in shop_refresh_loop: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
             if hint: hint.destroy()
             self.statistic_calculator.write_to_csv()
-            self.callback()
-            return
 
-        if hint: hint.destroy()
-        self.statistic_calculator.write_to_csv()
-        self.callback()
+            self.terminate_callback()
 
-    # show mini display
-    def show_mini_display(self):
+    def show_statistics_widget(self):
         bg_color = '#171717'
         fg_color = '#dddddd'
 
-        if self.root_window is None:
+        if self.settings_window is None:
             return None, None
 
-        # Display exit key
-        hint = tk.Toplevel(self.root_window)
+        hint = tk.Toplevel(self.settings_window)
+        pos = self.game_window.AXPosition
 
-        pos = self.window.AXPosition
-        hint.geometry(r'200x200+%d+%d' % (pos[0], pos[1] + self.window.AXSize[1]))
+        hint.geometry(r'200x200+%d+%d' % (pos[0], pos[1] + self.game_window.AXSize[1]))
         hint.title('Hint')
-
-        # Attach to main window (do not grab focus) and ensure main window regains focus
-        try:
-            hint.transient(self.root_window)
-        except Exception:
-            print('Show mini window failed.')
 
         tk.Label(master=hint, text='Press ESC to stop refreshing!', bg=bg_color, fg=fg_color).pack()
         hint.config(bg=bg_color)
@@ -330,7 +465,7 @@ class SecretShopRefresh:
         mini_labels = []
 
         # packing mini image
-        for img in self.statistic_calculator.get_images():
+        for img in self.statistic_calculator.get_show_images():
             frame = tk.Frame(mini_stats, bg=bg_color)
             tk.Label(master=frame, image=img, bg=bg_color).pack(side=tk.LEFT)
             count = tk.Label(master=frame, text='0', bg=bg_color, fg='#FFBF00')
@@ -340,78 +475,168 @@ class SecretShopRefresh:
         mini_stats.pack()
         return hint, mini_labels
 
-    # add item to list
+    def safe_locate_center_button_on_game_window(self, image_path, confidence=0.8) -> pyautogui.Point | None:
+        try:
+            print('Searching for button on screen:', image_path, self.debug)
+            region = safe_get_window_param(self.game_window)
+
+            box = pyautogui.locateOnScreen(image_path,
+                                           region=region,
+                                           confidence=confidence)
+            print('Locating button on screen:', image_path, 'Found:', box)
+            if not box:
+                if self.debug: print('No button found on screen (debug):', image_path)
+                return None
+
+            center = pyautogui.center(box)
+            if self.debug:
+                try:
+                    saved = save_debug_screenshot(image_path, box, center)
+                    print('Saved debug screenshot to', saved)
+                except Exception as e:
+                    print('Failed to save debug screenshot:', e)
+
+            return center
+        except Exception as e:
+            print('Failed to locate button on screen:', e)
+            if self.debug: print('No button found on screen:', image_path)
+        return None
+
     def add_search_item(self, path: str, name='', price=0, count=0):
         print("Adding search item:", name)
         self.statistic_calculator.add_shop_item(path, name, price, count)
 
-    # Add randomness to click position
+    def click_buy(self, item_pos):
+        if item_pos is None:
+            return False
+        # Calculate buy position based on item position
+        left, top, width, height = safe_get_window_param(self.game_window)
+
+        # Buy button is at 90% of width (your original calculation was correct)
+        x = left + width * 0.90
+        y = item_pos.y
+
+        if self.debug: print('Buy item at position:', item_pos, (x, y))
+        self.click_on_point(x, y)
+        time.sleep(0.2)  # Small delay before confirming
+
+        self.click_confirm_buy()
+        return True
+
+    def click_confirm_buy(self):
+        left, top, width, height = safe_get_window_param(self.game_window)
+        x = left + width * 0.55
+        y = top + height * 0.70
+        if self.debug: print('Confirm buy at position:', (x, y))
+        self.click_on_point(x, y)
+
     def click_button(self, button_url):
-        button_center = safe_locate_center_button_on_screen(get_relative_path(button_url))
+        path = get_relative_path(button_url)
+        button_center = self.safe_locate_center_button_on_game_window(path)
+        if self.debug: save_debug_screenshot(path, center=button_center)
         if not button_center: raise Exception(f'Button {button_url} not found on the screen.')
 
         if self.debug: print('Found button at:', button_center)
 
-        rand_x = random.randint(-3, 3) + button_center.x
-        rand_y = random.randint(-3, 3) + button_center.y
+        self.click_on_point(button_center.x, button_center.y)
 
-        # scale click position to logical screen coords
-        screen_w, screen_h = pyautogui.size()
-        full_img = pyautogui.screenshot()
-        img_w, img_h = full_img.size
-        scale_x = screen_w / img_w if img_w else 1.0
-        scale_y = screen_h / img_h if img_h else 1.0
-
-        rand_x = int(rand_x * scale_x)
-        rand_y = int(rand_y * scale_y)
+    def click_on_point(self, x, y):
+        rand_x = random.randint(-3, 3) + x
+        rand_y = random.randint(-3, 3) + y
 
         pyautogui.moveTo(rand_x, rand_y, duration=self.mouse_sleep)
-        if self.debug: print('Moving button at:', (rand_x, rand_y))
+        if self.debug: print('Moving to:', (rand_x, rand_y))
 
-        pyautogui.click(rand_x, rand_y, clicks=2, interval=self.mouse_sleep)
-        if self.debug: print('Clicked button at:', (rand_x, rand_y))
+        pyautogui.click(rand_x, rand_y, interval=self.mouse_sleep)
+        if self.debug: print('Clicked at:', (rand_x, rand_y))
 
         time.sleep(random.uniform(self.mouse_sleep - 0.1, self.mouse_sleep + 0.1))
 
-    # # REFRESH MACRO
     def click_refresh(self):
-        # click twice to open refresh menu?
-        print('Clicking refresh button...')
-        self.click_button('refresh_button.png')
+        if self.debug: print('Clicking refresh button...')
+        left, top, width, height = safe_get_window_param(self.game_window)
+        x = left + width * 0.20
+        y = top + height * 0.90
+
+        self.click_on_point(x, y)
+
         if self.debug: time.sleep(1)
         self.click_confirm_refresh()
 
     def click_confirm_refresh(self):
-        self.click_button('confirm.png')
-        time.sleep(random.uniform(self.screenshot_sleep - 0.1, self.screenshot_sleep + 0.1))  # Account for Loading
+        left, top, width, height = safe_get_window_param(self.game_window)
+
+        x = left + width * 0.58
+        y = top + height * 0.65
+
+        self.click_on_point(x, y)
+
+        time.sleep(random.uniform(self.screenshot_sleep - 0.1, self.screenshot_sleep + 0.1))
 
     def scroll_down(self):
-        left, top, width, height = safe_get_window_param(self.window)
+        left, top, width, height = safe_get_window_param(self.game_window)
 
         start_x = left + width * 0.58
         start_y = top + height * 0.65
         end_y = start_y - height * 0.5
 
-        # Move to start
         pyautogui.moveTo(start_x, start_y, duration=0.2)
-
-        # Drag smoothly
         pyautogui.dragTo(start_x, end_y, duration=0.5, button='left')
-        time.sleep(max(0.3, self.screenshot_sleep))
+        time.sleep(max(0.3, self.screenshot_sleep) + 0.1)
 
     def scroll_up(self):
-        left, top, width, height = safe_get_window_param(self.window)
+        left, top, width, height = safe_get_window_param(self.game_window)
 
         start_x = left + width * 0.58
         start_y = top + height * 0.65
-        end_y = start_y + height * 0.5  # move down to scroll up
+        end_y = start_y + height * 0.5
 
-        # Move to start position
         pyautogui.moveTo(start_x, start_y, duration=0.2)
-
-        # Drag smoothly
         pyautogui.dragTo(start_x, end_y, duration=0.5, button='left')
         time.sleep(max(0.3, self.screenshot_sleep))
+
+    def search_item(self, screenshot, item: ShopItem) -> pyautogui.Point | None:
+
+        process_screenshot = cv2.GaussianBlur(screenshot, (3, 3), 0)
+        process_item = cv2.GaussianBlur(item.search_image, (3, 3), 0)
+
+        left, top, width, height = safe_get_window_param(self.game_window)
+
+        result = cv2.matchTemplate(process_screenshot, process_item, cv2.TM_CCOEFF_NORMED)
+        loc = np.where(result >= 0.8)
+
+
+        if loc[0].size > 0:
+            x = left + width * 0.90
+            y = top + loc[0][0] + height * 0.085
+            pos = pyautogui.Point(x, y)
+            return pos
+        return None
+
+        # if loc[0].size > 0:
+        #     # Get the template match position
+        #     match_y = loc[0][0]  # Y position in screenshot (window-relative)
+        #     match_x = loc[1][0]  # X position in screenshot (window-relative)
+        #
+        #     template_h = item.search_image.shape[0]
+        #
+        #     # Calculate center of matched item
+        #     item_center_y_window = match_y + template_h // 2
+        #
+        #     # Convert to screen coordinates
+        #     item_center_y_screen = top + item_center_y_window
+        #
+        #     # Buy button X position (screen coordinates)
+        #     buy_button_x = left + width * 0.90
+        #
+        #     if self.debug:
+        #         print(f'Item matched at window coords: ({match_x}, {match_y})')
+        #         print(f'Item center Y (window): {item_center_y_window}')
+        #         print(f'Item center Y (screen): {item_center_y_screen}')
+        #         print(f'Buy button will be at: ({buy_button_x}, {item_center_y_screen})')
+        #
+        #     pos = pyautogui.Point(buy_button_x, item_center_y_screen)
+        #     return pos
 
 
 class RefresherGUI:
@@ -512,7 +737,6 @@ class RefresherGUI:
         pack_label('Setting:', 18, (10, 0))
 
         ## Step 3 Select setting
-        # setting frame
         additional_setting_frame = tk.Frame(self.settings_window)
         additional_setting_frame.config(bg=self.app_config.unite_bg_color)
 
@@ -577,10 +801,10 @@ class RefresherGUI:
         self.settings_window.title('Press ESC to stop!')
         self.lock_start_button = True
         self.start_button.config(state=tk.DISABLED)
-        self.ssr = SecretShopRefresh(title_name=self.app_config.app_title, callback=self.refresh_complete,
+        self.ssr = SecretShopRefresh(title_name=self.app_config.app_title, terminate_callback=self.refresh_complete,
                                      debug=self.app_config.DEBUG)
 
-        self.ssr.root_window = self.settings_window
+        self.ssr.settings_window = self.settings_window
 
         # setting item to search while refreshing
         for item in self.app_config.ALL_ITEMS:
@@ -611,5 +835,4 @@ class RefresherGUI:
 
 
 if __name__ == '__main__':
-    g = RefresherGUI()
-    print('started')
+    RefresherGUI()
