@@ -113,36 +113,6 @@ def validate_int(value):
     return 0 <= int_value < 100000000
 
 
-def save_debug_screenshot(image_path: str, box=None, center=None, debug_dir: str = 'debug_screens'):
-    """Save a screenshot with a red rectangle around `box` and a marker at `center`."""
-    from PIL import ImageDraw, ImageFont
-
-    os.makedirs(debug_dir, exist_ok=True)
-    shot = pyautogui.screenshot()
-    draw = ImageDraw.Draw(shot)
-
-    if not box or not center:
-        fname = os.path.join(debug_dir, f'annot_{os.path.basename(image_path)}_{int(time.time())}.png')
-        shot.save(fname)
-        return fname
-
-    # box has attributes left, top, width, height
-    x1, y1 = box.left, box.top
-    x2, y2 = box.left + box.width, box.top + box.height
-    print(x1, y1, x2, y2)
-
-    # rectangle + center marker
-    outline = (255, 0, 0)
-    draw.rectangle([x1, y1, x2, y2], outline=outline, width=3)
-    print('drow center at:', center)
-    r = 6
-    draw.ellipse([(center.x - r, center.y - r), (center.x + r, center.y + r)], fill=outline)
-
-    fname = os.path.join(debug_dir, f'annot_{os.path.basename(image_path)}_{int(time.time())}.png')
-    shot.save(fname)
-    return fname
-
-
 class ShopItem:
     def __init__(self, path='', show_image=None, search_image=None, price=0, count=0):
         self.path = path
@@ -172,8 +142,9 @@ class RefreshStatistic:
 
         image2 = cv2.imread(relative_path)
         image2 = cv2.cvtColor(image2, cv2.COLOR_BGR2GRAY)
-        if path == 'mys.png':
-            image2 = cv2.resize(image2, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_LINEAR)
+        # if path == 'mys.png':
+        #     image2 = cv2.resize(image2, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_LINEAR)
+        image2 = cv2.resize(image2, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_LINEAR)
         self.items[name] = ShopItem(path, show_image=image, search_image=image2, price=price, count=count)
 
     def get_inventory(self):
@@ -230,6 +201,8 @@ class SecretShopRefresh:
                  debug: bool = False):
         # init state
         self.debug = debug
+        self.debug_screenshot = False
+        self.is_stop_refresh = False
         self.mouse_sleep = 0.3
         self.screenshot_sleep = 0.3
         self.terminate_callback = terminate_callback
@@ -359,7 +332,7 @@ class SecretShopRefresh:
         print('Start shop refreshing loop ...')
         activate_game()
         # Show statistics widget
-        hint, mini_labels = self.show_statistics_widget()
+        hint, mini_labels, refresh_label = self.show_statistics_widget()
 
         def update_statistics_widget():
             for label, count in zip(mini_labels, self.statistic_calculator.get_item_counts()):
@@ -371,6 +344,7 @@ class SecretShopRefresh:
 
             if self.debug: print('Searching for items to buy ...')
 
+            time.sleep(self.screenshot_sleep)
             screenshot = self.take_screenshot_mss()
 
             for key, shop_item in self.statistic_calculator.get_inventory().items():
@@ -391,6 +365,7 @@ class SecretShopRefresh:
                     if self.click_buy(item_pos):
                         shop_item.count += 1
                         bought.add(key)
+
                     if hint: update_statistics_widget()
 
         time.sleep(self.mouse_sleep)
@@ -430,8 +405,9 @@ class SecretShopRefresh:
                                                  self.statistic_calculator.refresh_count >= self.budget):
                     break
 
-                self.click_refresh()
+                if not self.is_stop_refresh: self.click_refresh()
                 self.statistic_calculator.increment_refresh_count()
+                if hint: refresh_label.config(text=str(self.statistic_calculator.refresh_count))
                 time.sleep(self.mouse_sleep)
 
         except Exception as e:
@@ -460,6 +436,12 @@ class SecretShopRefresh:
         tk.Label(master=hint, text='Press ESC to stop refreshing!', bg=bg_color, fg=fg_color).pack()
         hint.config(bg=bg_color)
 
+        refresh_frame = tk.Frame(master=hint, bg=bg_color)
+        tk.Label(master=refresh_frame, text='Refresh count: ', bg=bg_color, fg=fg_color).pack(side=tk.LEFT)
+        refresh_count_label = tk.Label(master=refresh_frame, text='0', bg=bg_color, fg='#FFBF00')
+        refresh_count_label.pack(side=tk.RIGHT)
+        refresh_frame.pack()
+
         # Display stat
         mini_stats = tk.Frame(master=hint, bg=bg_color)
         mini_labels = []
@@ -473,7 +455,7 @@ class SecretShopRefresh:
             mini_labels.append(count)
             frame.pack()
         mini_stats.pack()
-        return hint, mini_labels
+        return hint, mini_labels, refresh_count_label
 
     def safe_locate_center_button_on_game_window(self, image_path, confidence=0.8) -> pyautogui.Point | None:
         try:
@@ -553,12 +535,18 @@ class SecretShopRefresh:
         time.sleep(random.uniform(self.mouse_sleep - 0.1, self.mouse_sleep + 0.1))
 
     def click_refresh(self):
+        if self._stop_event.is_set():  # Check for stop at start
+            return
+
         if self.debug: print('Clicking refresh button...')
         left, top, width, height = safe_get_window_param(self.game_window)
         x = left + width * 0.20
         y = top + height * 0.90
 
         self.click_on_point(x, y)
+
+        if self._stop_event.is_set():  # Check for stop at start
+            return
 
         if self.debug: time.sleep(1)
         self.click_confirm_refresh()
@@ -568,6 +556,9 @@ class SecretShopRefresh:
 
         x = left + width * 0.58
         y = top + height * 0.65
+
+        if self._stop_event.is_set():  # Check for stop at start
+            return
 
         self.click_on_point(x, y)
 
@@ -603,6 +594,9 @@ class SecretShopRefresh:
         left, top, width, height = safe_get_window_param(self.game_window)
 
         result = cv2.matchTemplate(process_screenshot, process_item, cv2.TM_CCOEFF_NORMED)
+
+        if self.debug_screenshot: self.debug_search(item, process_item, process_screenshot, result)
+
         loc = np.where(result >= 0.8)
 
 
@@ -637,6 +631,25 @@ class SecretShopRefresh:
         #
         #     pos = pyautogui.Point(buy_button_x, item_center_y_screen)
         #     return pos
+
+    def debug_search(self, item: ShopItem, process_item: Mat | ndarray[Any, dtype[integer[Any] | floating[Any]]] | UMat,
+                     process_screenshot: Mat | ndarray[Any, dtype[integer[Any] | floating[Any]]] | UMat,
+                     result: Mat | ndarray[Any, dtype[integer[Any] | floating[Any]]]):
+        # Save processed images and match result for debugging
+        try:
+            os.makedirs('debug_screenshots', exist_ok=True)
+            timestamp = int(time.time() * 1000)
+            base_name = f"debug_screenshots/{timestamp}_{os.path.basename(item.path).replace('.', '_')}"
+            cv2.imwrite(base_name + "_screenshot.png", process_screenshot)
+            cv2.imwrite(base_name + "_item.png", process_item)
+            norm = cv2.normalize(result, None, 0, 255, cv2.NORM_MINMAX)
+            heatmap = np.uint8(norm)
+            heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+            cv2.imwrite(base_name + "_result.png", heatmap_color)
+
+        except Exception as e:
+            if self.debug:
+                print("Failed to save processed debug images:", e)
 
 
 class RefresherGUI:
